@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { CliUsageError, parseCliArgs } from '../src/args.js'
 
-const COMMANDS = ['verify', 'manifest', 'hash', 'verify-receipt', 'c2pa'] as const
+const COMMANDS = ['verify', 'manifest', 'hash', 'verify-receipt', 'c2pa', 'verify-lineage'] as const
 
 type Case = [string, string[], Record<string, string>]
 
@@ -93,6 +93,16 @@ describe('long flags and camelCase fallbacks', () => {
     ['manifest', ['--videoHash', 'ab'], { videoHash: 'ab' }],
     ['verify-receipt', ['--proof-id', 'p1'], { 'proof-id': 'p1' }],
     ['verify-receipt', ['--proofId', 'p1'], { proofId: 'p1' }],
+    [
+      'verify-lineage',
+      ['--output-digest', 'abc', '--contract-id', 'C1'],
+      { 'output-digest': 'abc', 'contract-id': 'C1' },
+    ],
+    [
+      'verify-lineage',
+      ['--outputDigest', 'abc', '--contractId', 'C1'],
+      { outputDigest: 'abc', contractId: 'C1' },
+    ],
   ]
 
   it.each(cases)('%s keeps the long flag names handlers read', (command, args, flags) => {

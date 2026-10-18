@@ -1,6 +1,6 @@
 import { parseArgs } from 'node:util'
 
-export type Command = 'verify' | 'manifest' | 'hash' | 'verify-receipt' | 'c2pa' | 'help'
+export type Command = 'verify' | 'manifest' | 'hash' | 'verify-receipt' | 'c2pa' | 'verify-lineage' | 'help'
 
 export interface ParsedArgs {
   command: Command
@@ -71,6 +71,19 @@ const COMMAND_OPTIONS: Record<Exclude<Command, 'help'>, OptionSet> = {
     receipt: alias('r'),
     output: alias('o'),
     title: text,
+    debug: toggle,
+  },
+  'verify-lineage': {
+    'output-digest': text,
+    outputDigest: text,
+    'contract-id': text,
+    contractId: text,
+    'rpc-url': text,
+    rpcUrl: text,
+    'source-address': text,
+    sourceAddress: text,
+    network: text,
+    output: alias('o'),
     debug: toggle,
   },
 }
