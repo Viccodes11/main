@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import re
 import threading
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from analytics.log_processor import LogEntry, LogProcessor, validate_log_export_safety
@@ -20,6 +21,7 @@ except Exception:
 
 
 EXPORT_FORMAT_VERSION = "1.0.0"
+DELETION_PREVIEW_SCHEMA_VERSION = "1.0.0"
 
 # Sentinel values distinguishing withdrawn consent from data never collected.
 CONSENT_STATE_NEVER_COLLECTED = "never_collected"
@@ -27,6 +29,122 @@ CONSENT_STATE_WITHDRAWN = "withdrawn"
 CONSENT_STATE_GRANTED = "granted"
 
 _SAFE_LABEL_RE = re.compile(r"[^A-Za-z0-9._-]")
+_SAFE_CLASS_RE = re.compile(r"[^a-z0-9_.-]")
+
+
+class TenantAuthorizationError(PermissionError):
+    """Raised when a deletion preview request fails tenant isolation checks."""
+
+
+@dataclass
+class DeletionPreviewPolicy:
+    """Bounds and retention thresholds governing privacy-preserving deletion previews."""
+
+    count_cap_per_bucket: int = 1000
+    max_buckets: int = 64
+    export_artifact_retention_seconds: float = 30.0 * 86400.0
+    log_entry_retention_seconds: float = 30.0 * 86400.0
+    withdrawn_retention_seconds: float = 0.0
+    data_class_retention_seconds: Dict[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.count_cap_per_bucket < 1:
+            raise ValueError("count_cap_per_bucket must be >= 1")
+        if self.max_buckets < 1:
+            raise ValueError("max_buckets must be >= 1")
+        if self.export_artifact_retention_seconds < 0:
+            raise ValueError("export_artifact_retention_seconds must be >= 0")
+        if self.log_entry_retention_seconds < 0:
+            raise ValueError("log_entry_retention_seconds must be >= 0")
+        if self.withdrawn_retention_seconds < 0:
+            raise ValueError("withdrawn_retention_seconds must be >= 0")
+
+
+DELETION_PREVIEW_POLICY_DEFAULT: DeletionPreviewPolicy = DeletionPreviewPolicy()
+
+
+@dataclass
+class DeletionPreviewBucket:
+    """Bounded deletion counts for one (data_class, retention_policy) pair."""
+
+    data_class: str
+    retention_policy: str
+    eligible_count: int
+    retained_count: int
+    eligible_capped: bool = False
+    retained_capped: bool = False
+
+
+@dataclass
+class DeletionPreviewResult:
+    """Privacy-preserving, tenant-isolated, non-destructive deletion preview."""
+
+    schema_version: str = DELETION_PREVIEW_SCHEMA_VERSION
+    tenant_scope_digest: str = ""
+    generated_at_epoch_seconds: float = 0.0
+    count_cap_per_bucket: int = 1000
+    buckets: List[DeletionPreviewBucket] = field(default_factory=list)
+    buckets_truncated: bool = False
+    total_eligible_bounded: int = 0
+    total_retained_bounded: int = 0
+    any_count_capped: bool = False
+    dry_run: bool = True
+
+
+def _authorize_tenant_scope(
+    authorized_tenant: Optional[str],
+    requested_tenant: Optional[str],
+) -> str:
+    """Fail-closed check ensuring the requested tenant matches the authorized tenant."""
+    if not isinstance(authorized_tenant, str) or not authorized_tenant.strip():
+        raise TenantAuthorizationError("authorized_tenant_required")
+    if not isinstance(requested_tenant, str) or not requested_tenant.strip():
+        raise TenantAuthorizationError("requested_tenant_required")
+    auth_clean = authorized_tenant.strip()
+    req_clean = requested_tenant.strip()
+    if not hmac.compare_digest(auth_clean, req_clean):
+        raise TenantAuthorizationError("tenant_scope_mismatch")
+    return auth_clean
+
+
+def _tenant_scope_digest(tenant: str) -> str:
+    return "tdg-v1:" + hashlib.sha256(tenant.encode("utf-8")).hexdigest()[:16]
+
+
+def _sanitize_data_class(raw: Optional[str], default: str = "analytics_logs") -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        return default
+    cleaned = _SAFE_CLASS_RE.sub("_", raw.strip().lower())[:64].strip("_")
+    return cleaned or default
+
+
+def _entry_belongs_to_tenant(entry: Any, tenant: str) -> bool:
+    """Return True only when an entry explicitly belongs to ``tenant``."""
+    candidate: Optional[str] = None
+    for attr in ("account_tag", "tenant_id"):
+        val = getattr(entry, attr, None)
+        if isinstance(val, str) and val.strip():
+            candidate = val.strip()
+            break
+    if candidate is None:
+        labels = getattr(entry, "labels", None)
+        if isinstance(labels, dict):
+            for key in ("tenant_id", "account_tag"):
+                val = labels.get(key)
+                if isinstance(val, str) and val.strip():
+                    candidate = val.strip()
+                    break
+    if candidate is None:
+        annotations = getattr(entry, "annotations", None)
+        if isinstance(annotations, dict):
+            for key in ("account_tag", "tenant_id"):
+                val = annotations.get(key)
+                if isinstance(val, str) and val.strip():
+                    candidate = val.strip()
+                    break
+    if candidate is None:
+        return False
+    return hmac.compare_digest(candidate, tenant)
 
 
 @dataclass
@@ -246,6 +364,144 @@ class ExportManager:
                 self._artifact_queue = [aid for aid in self._artifact_queue if aid != artifact_id]
                 return True
             return False
+
+    def preview_deletion(
+        self,
+        authorized_tenant: Optional[str],
+        requested_tenant: Optional[str],
+        consent_manager: Optional[Any] = None,
+        entries: Optional[List[LogEntry]] = None,
+        now_epoch_seconds: Optional[float] = None,
+        preview_policy: Optional[DeletionPreviewPolicy] = None,
+    ) -> DeletionPreviewResult:
+        """Compute a privacy-preserving, tenant-isolated deletion preview.
+
+        Returns bounded counts grouped by ``(data_class, retention_policy)``
+        without mutating consent state, export artifacts, or log entries, and
+        without exposing raw identifiers, payloads, or cross-tenant data.
+        """
+        tenant = _authorize_tenant_scope(authorized_tenant, requested_tenant)
+        policy = preview_policy if preview_policy is not None else DELETION_PREVIEW_POLICY_DEFAULT
+        now = now_epoch_seconds if now_epoch_seconds is not None else time.time()
+
+        # Raw tallies: (data_class, retention_policy) -> [eligible, retained]
+        tallies: Dict[Tuple[str, str], List[int]] = {}
+
+        def _record(data_class: str, retention_policy: str, eligible: bool) -> None:
+            key = (data_class, retention_policy)
+            pair = tallies.get(key)
+            if pair is None:
+                pair = [0, 0]
+                tallies[key] = pair
+            if eligible:
+                pair[0] += 1
+            else:
+                pair[1] += 1
+
+        # 1. Consent records (strictly single-tenant lookup).
+        if consent_manager is not None and hasattr(consent_manager, "preview_tenant_consent_deletion"):
+            summary = consent_manager.preview_tenant_consent_deletion(
+                tenant, now_epoch_seconds=now
+            )
+            if isinstance(summary, dict):
+                _record(
+                    _sanitize_data_class(str(summary.get("data_class", "consent_records")), "consent_records"),
+                    _sanitize_data_class(str(summary.get("retention_policy", "active_consent")), "active_consent"),
+                    bool(summary.get("eligible", False)),
+                )
+
+        # 2. Export artifacts belonging strictly to this tenant.
+        with self._lock:
+            artifacts_snapshot = list(self._artifacts.values())
+            if entries is not None:
+                entries_snapshot = list(entries)
+            elif self._processor is not None:
+                entries_snapshot = list(self._processor._entries[:])
+            else:
+                entries_snapshot = []
+
+        artifact_window = policy.data_class_retention_seconds.get(
+            "export_artifacts", policy.export_artifact_retention_seconds
+        )
+        for art in artifacts_snapshot:
+            owner = getattr(art, "exported_by_tag", None)
+            if not isinstance(owner, str) or not owner.strip():
+                continue
+            if not hmac.compare_digest(owner.strip(), tenant):
+                continue
+            age = max(0.0, now - float(getattr(art, "generated_at_epoch_seconds", 0.0)))
+            if getattr(art, "consent_state", None) == CONSENT_STATE_WITHDRAWN:
+                eligible = age >= policy.withdrawn_retention_seconds
+                _record("export_artifacts", "consent_withdrawn", eligible)
+            elif age >= artifact_window:
+                _record("export_artifacts", "retention_expired", True)
+            else:
+                _record("export_artifacts", "within_retention", False)
+
+        # 3. Analytics log entries belonging strictly to this tenant.
+        for entry in entries_snapshot:
+            if not _entry_belongs_to_tenant(entry, tenant):
+                continue
+            labels = getattr(entry, "labels", None)
+            raw_class = getattr(entry, "data_class", None)
+            if not raw_class and isinstance(labels, dict):
+                raw_class = labels.get("category")
+            data_class = _sanitize_data_class(raw_class, "analytics_logs")
+            entry_window = policy.data_class_retention_seconds.get(
+                data_class, policy.log_entry_retention_seconds
+            )
+            ts = float(getattr(entry, "timestamp_epoch_seconds", 0.0))
+            age = max(0.0, now - ts)
+            if getattr(entry, "consent_withdrawn", False):
+                eligible = age >= policy.withdrawn_retention_seconds
+                _record(data_class, "consent_withdrawn", eligible)
+            elif age >= entry_window:
+                _record(data_class, "retention_expired", True)
+            else:
+                _record(data_class, "within_retention", False)
+
+        # Build deterministically sorted, bounded buckets.
+        sorted_keys = sorted(tallies.keys())
+        buckets_truncated = len(sorted_keys) > policy.max_buckets
+        cap = policy.count_cap_per_bucket
+        buckets: List[DeletionPreviewBucket] = []
+        total_eligible = 0
+        total_retained = 0
+        any_capped = False
+
+        for data_class, retention_policy in sorted_keys[: policy.max_buckets]:
+            raw_elig, raw_ret = tallies[(data_class, retention_policy)]
+            elig_capped = raw_elig > cap
+            ret_capped = raw_ret > cap
+            elig_bounded = min(raw_elig, cap)
+            ret_bounded = min(raw_ret, cap)
+            if elig_capped or ret_capped:
+                any_capped = True
+            total_eligible += elig_bounded
+            total_retained += ret_bounded
+            buckets.append(
+                DeletionPreviewBucket(
+                    data_class=data_class,
+                    retention_policy=retention_policy,
+                    eligible_count=elig_bounded,
+                    retained_count=ret_bounded,
+                    eligible_capped=elig_capped,
+                    retained_capped=ret_capped,
+                )
+            )
+
+        return DeletionPreviewResult(
+            schema_version=DELETION_PREVIEW_SCHEMA_VERSION,
+            tenant_scope_digest=_tenant_scope_digest(tenant),
+            generated_at_epoch_seconds=now,
+            count_cap_per_bucket=cap,
+            buckets=buckets,
+            buckets_truncated=buckets_truncated,
+            total_eligible_bounded=total_eligible,
+            total_retained_bounded=total_retained,
+            any_count_capped=any_capped,
+            dry_run=True,
+        )
 
     def reset(self) -> None:
         with self._lock:
