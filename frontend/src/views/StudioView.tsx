@@ -48,9 +48,11 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
     acknowledgeSensitiveFields,
     registration,
     networkMismatch,
+    networkMismatchRecovery = null,
     isCancellable,
     handleEvidence,
     registerProof,
+    revalidateNetworkMismatch,
     cancelEvidence,
     cancelProving,
   } = evidence
@@ -98,7 +100,62 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
           <div className="sr-only" aria-live="polite" aria-atomic="true">{statusLabel}</div>
         </header>
 
-        {networkMismatch ? (
+        {networkMismatchRecovery ? (
+          <div
+            className="network-mismatch-banner network-mismatch-recovery"
+            role="alert"
+            aria-label="Guided network mismatch recovery"
+          >
+            <span className="network-mismatch-icon" aria-hidden="true">⚠</span>
+            <div className="network-mismatch-recovery__body">
+              <strong className="network-mismatch-recovery__title">
+                Network mismatch — switch wallet network to resume
+              </strong>
+              <p className="network-mismatch-recovery__reason">{networkMismatchRecovery.reason}</p>
+              <dl className="network-mismatch-recovery__details">
+                <div>
+                  <dt>Required network</dt>
+                  <dd>{networkMismatchRecovery.requiredNetwork}</dd>
+                </div>
+                <div>
+                  <dt>Current wallet network</dt>
+                  <dd>{networkMismatchRecovery.currentWalletNetwork}</dd>
+                </div>
+              </dl>
+              <ol className="network-mismatch-recovery__steps">
+                <li>{networkMismatchRecovery.remediation}</li>
+                <li>
+                  Run fresh validation of your wallet network and selected evidence intent before
+                  resuming registration.
+                </li>
+              </ol>
+              {networkMismatchRecovery.validationError ? (
+                <p className="network-mismatch-recovery__error">
+                  {networkMismatchRecovery.validationError}
+                </p>
+              ) : null}
+              <div className="network-mismatch-recovery__actions">
+                <button
+                  type="button"
+                  className="secondary-action network-mismatch-recovery__action"
+                  disabled={
+                    networkMismatchRecovery.isValidating || isBusy || !revalidateNetworkMismatch
+                  }
+                  aria-busy={networkMismatchRecovery.isValidating || undefined}
+                  onClick={() => {
+                    if (revalidateNetworkMismatch) {
+                      void revalidateNetworkMismatch(wallet)
+                    }
+                  }}
+                >
+                  {networkMismatchRecovery.isValidating
+                    ? 'Validating network...'
+                    : 'Re-validate & resume'}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : networkMismatch ? (
           <div className="network-mismatch-banner" role="alert">
             <span className="network-mismatch-icon" aria-hidden="true">⚠</span>
             <span>{networkMismatch}</span>
@@ -289,7 +346,7 @@ export function StudioView({ wallet, evidence, verification, provenanceRecord }:
           <button
             className="primary-action"
             type="button"
-            disabled={!proof || !!networkMismatch || isBusy}
+            disabled={!proof || !!networkMismatch || !!networkMismatchRecovery || isBusy}
             aria-busy={isBusy || undefined}
             onClick={() => void registerProof(wallet)}
           >
