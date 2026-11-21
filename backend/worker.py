@@ -2,14 +2,18 @@ import logging
 import time
 import os
 import re
+from datetime import datetime, timezone
 from logging_utils import log_structured
 import threading
 import traceback
 from pathlib import Path
 
 from db import (
+    DEADLINE_EXCEEDED_REASON,
     DEFAULT_HEARTBEAT_STALE_SECONDS,
+    DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT,
     STALE_HEARTBEAT_REASON,
+    _parse_iso_utc,
     lease_job,
     heartbeat_job,
     get_job_heartbeat_state,
@@ -265,10 +269,22 @@ def _worker_heartbeat_stale_seconds() -> float:
         return DEFAULT_HEARTBEAT_STALE_SECONDS
 
 
+def _worker_max_concurrent_video_jobs_per_tenant() -> int:
+    raw = os.getenv("WORKER_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT")
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT
+    try:
+        val = int(raw)
+        return val if val > 0 else DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT
+    except ValueError:
+        return DEFAULT_MAX_CONCURRENT_VIDEO_JOBS_PER_TENANT
+
+
 def run_worker(
     stop_event: threading.Event | None = None,
     grace_period_seconds: float | None = None,
     heartbeat_stale_seconds: float | None = None,
+    max_concurrent_video_jobs_per_tenant: int | None = None,
 ):
     init_db()
     config = load_config()
@@ -284,6 +300,9 @@ def run_worker(
 
     if heartbeat_stale_seconds is None:
         heartbeat_stale_seconds = _worker_heartbeat_stale_seconds()
+
+    if max_concurrent_video_jobs_per_tenant is None:
+        max_concurrent_video_jobs_per_tenant = _worker_max_concurrent_video_jobs_per_tenant()
 
     def _signal_handler(signum, frame):
         LOGGER.info(f"Received signal {signum}, initiating graceful shutdown")
@@ -340,6 +359,7 @@ def run_worker(
                 WORKER_ID,
                 ["embed", "extract", "silent_witness", "verify_tx"],
                 lease_duration=300,
+                max_concurrent_per_tenant=max_concurrent_video_jobs_per_tenant,
             )
             if not job:
                 stop_event.wait(2)
@@ -347,11 +367,14 @@ def run_worker(
 
             job_id = job["id"]
             job_type = job["type"]
+            job_deadline = _parse_iso_utc(job.get("deadline_at"))
             LOGGER.info(f"Leased job {job_id} of type {job_type}")
 
             hb_stop_event = threading.Event()
             hb_thread = threading.Thread(target=heartbeat_loop, args=(job_id, hb_stop_event))
             hb_thread.start()
+
+            deadline_exceeded = threading.Event()
 
             def _execute_job():
                 try:
@@ -365,16 +388,18 @@ def run_worker(
                         res = process_verify_tx(job)
                     else:
                         raise ValueError(f"Unknown job type {job_type}")
-                    complete_job(job_id, res)
-                    LOGGER.info(f"Completed job {job_id}")
+                    if not deadline_exceeded.is_set():
+                        complete_job(job_id, res)
+                        LOGGER.info(f"Completed job {job_id}")
                 except Exception as err:
-                    safe_message = sanitize_exception_text(err)
-                    LOGGER.error(f"Failed job {job_id}: {safe_message}")
-                    LOGGER.error(sanitize_traceback(err))
-                    is_fatal = isinstance(err, ValueError) and job_type != "verify_tx"
-                    if job_type == "verify_tx":
-                        is_fatal = isinstance(err, ValueError)
-                    fail_job(job_id, safe_message, is_fatal=is_fatal)
+                    if not deadline_exceeded.is_set():
+                        safe_message = sanitize_exception_text(err)
+                        LOGGER.error(f"Failed job {job_id}: {safe_message}")
+                        LOGGER.error(sanitize_traceback(err))
+                        is_fatal = isinstance(err, ValueError) and job_type != "verify_tx"
+                        if job_type == "verify_tx":
+                            is_fatal = isinstance(err, ValueError)
+                        fail_job(job_id, safe_message, is_fatal=is_fatal)
                 finally:
                     hb_stop_event.set()
                     hb_thread.join()
@@ -385,6 +410,27 @@ def run_worker(
 
             while work_thread.is_alive():
                 work_thread.join(timeout=0.1)
+                if (
+                    job_deadline is not None
+                    and work_thread.is_alive()
+                    and datetime.now(timezone.utc) >= job_deadline
+                ):
+                    deadline_exceeded.set()
+                    hb_stop_event.set()
+                    log_structured(
+                        LOGGER,
+                        logging.WARNING,
+                        {
+                            "event": "job_processing_deadline_exceeded",
+                            "job_id": job_id,
+                            "job_type": job_type,
+                            "reason": DEADLINE_EXCEEDED_REASON,
+                            "retryable": False,
+                            "cryptographic_failure": False,
+                        },
+                    )
+                    fail_job(job_id, "Processing deadline exceeded", is_fatal=True)
+                    break
                 if stop_event.is_set() and work_thread.is_alive():
                     work_thread.join(timeout=grace_period_seconds)
                     if work_thread.is_alive():
